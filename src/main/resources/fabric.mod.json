@@ -18,13 +18,19 @@
   ],
   "license": "CC0-1.0",
   "icon": "assets/optifabric/icon.png",
-  "environment": "*",
+  "environment": "client",
+  "entrypoints": {
+    "main": [
+      "me.modmuss50.optifabric.mod.Optifabric"
+    ]
+  },
   "custom": {
+    "fabric-renderer-indigo:force_compatibility" : true,
     "mm:early_risers": [
       "me.modmuss50.optifabric.mod.OptifabricSetup"
     ]
   },
-  "requires": {
+  "depends": {
     "fabricloader": ">=0.4.0"
   }
 }
