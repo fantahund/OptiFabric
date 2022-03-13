@@ -12,22 +12,30 @@ import net.fabricmc.loader.launch.knot.Knot;
 import net.fabricmc.loader.util.UrlConversionException;
 import net.fabricmc.loader.util.UrlUtil;
 import net.fabricmc.loader.util.mappings.TinyRemapperMappingsHelper;
-import net.fabricmc.mappings.*;
-import net.fabricmc.stitch.commands.CommandProposeFieldNames;
+import net.fabricmc.mapping.reader.v2.TinyMetadata;
+import net.fabricmc.mapping.tree.ClassDef;
+import net.fabricmc.mapping.tree.TinyTree;
 import net.fabricmc.tinyremapper.IMappingProvider;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.zeroturnaround.zip.ZipUtil;
 
-import java.io.*;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.*;
-import java.util.Map.Entry;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 public class OptifineSetup {
@@ -167,28 +175,14 @@ public class OptifineSetup {
 		//In dev
 		if (fabricLauncher.isDevelopment()) {
 			try {
-				File fullMappings = getDevMappings();
-				return (classMap, fieldMap, methodMap) -> {
-					RemapUtils.getTinyRemapper(fullMappings, from, to).load(classMap, fieldMap, methodMap);
-
-					Map<String, String> extra = new HashMap<>();
-					Pattern regex = Pattern.compile("(\\w+)\\/(\\w+);;([\\w/;]+)");
-
-					for (Entry<String, String> entry : fieldMap.entrySet()) {
-						if ("CLOUDS".equals(entry.getValue())) {
-							Matcher matcher = regex.matcher(entry.getKey());
-							if (!matcher.matches()) throw new IllegalStateException("Couldn't match " + entry.getKey() + " => " + entry.getValue());
-							extra.put(matcher.group(1) + "/CLOUDS;;" + matcher.group(3), "CLOUDS_OF");
-						}
-
-						if ("renderDistance".equals(entry.getValue())) {
-							Matcher matcher = regex.matcher(entry.getKey());
-							if (!matcher.matches()) throw new IllegalStateException("Couldn't match " + entry.getKey() + " => " + entry.getValue());
-							extra.put(matcher.group(1) + "/renderDistance;;" + matcher.group(3), "renderDistance_OF");
-						}
-					}
-
-					fieldMap.putAll(extra);
+				File fullMappings = extractMappings();
+				return (out) -> {
+					RemapUtils.getTinyRemapper(fullMappings, from, to).load(out);
+					//TODO use the mappings API here to stop neededing to change this each version
+					out.acceptField(new IMappingProvider.Member("dma", "CLOUDS", "Ldln;"),
+							"CLOUDS_OF");
+					out.acceptField(new IMappingProvider.Member("ebx", "renderDistance", "I"),
+							"renderDistance_OF");
 				};
 			} catch (Exception e) {
 				throw new RuntimeException(e);
@@ -196,51 +190,22 @@ public class OptifineSetup {
 		}
 
 		//In prod
-		Mappings mappingsNew = new Mappings() {
-			private final Mappings mappings = mappingConfiguration.getMappings();
+		TinyTree mappingsNew = new TinyTree() {
+			private final TinyTree mappings = mappingConfiguration.getMappings();
 
 			@Override
-			public Collection<String> getNamespaces() {
-				return mappings.getNamespaces();
+			public TinyMetadata getMetadata() {
+				return mappings.getMetadata();
 			}
 
 			@Override
-			public Collection<ClassEntry> getClassEntries() {
-				return mappings.getClassEntries();
+			public Map<String, ClassDef> getDefaultNamespaceClassMap() {
+				return mappings.getDefaultNamespaceClassMap();
 			}
 
 			@Override
-			public Collection<FieldEntry> getFieldEntries() {
-				Collection<FieldEntry> fields = mappings.getFieldEntries();
-				List<FieldEntry> extra = new ArrayList<>();
-
-				for (FieldEntry field : fields) {
-					String interName = field.get("intermediary").getName();
-
-					//Option#CLOUDS
-					if ("field_1937".equals(interName)) {
-						extra.add(namespace -> {
-							EntryTriple real = field.get(namespace);
-							return new EntryTriple(real.getOwner(), "official".equals(namespace) ? "CLOUDS" : "CLOUDS_OF", real.getDesc());
-						});
-					}
-
-					//WorldRenderer#renderDistance
-					if ("field_4062".equals(interName)) {
-						extra.add(namespace -> {
-							EntryTriple real = field.get(namespace);
-							return new EntryTriple(real.getOwner(), "official".equals(namespace) ? "renderDistance" : "renderDistance_OF", real.getDesc());
-						});
-					}
-				}
-
-				fields.addAll(extra);
-				return fields;
-			}
-
-			@Override
-			public Collection<MethodEntry> getMethodEntries() {
-				return mappings.getMethodEntries();
+			public Collection<ClassDef> getClasses() {
+				return mappings.getClasses();
 			}
 		};
 		return TinyRemapperMappingsHelper.create(mappingsNew, from, to);
@@ -270,11 +235,26 @@ public class OptifineSetup {
 			Path path = entrypointResult.get().getParent();
 			Path minecraftJar = path.resolve(String.format("minecraft-%s-client.jar", OptifineVersion.minecraftVersion)); //Lets hope you are using loom in dev
 			if (!Files.exists(minecraftJar)) {
-				throw new FileNotFoundException("Could not find minecraft jar!");
+				return getNewMinecraftDevJar();
 			}
 			return minecraftJar;
 		}
 		return entrypointResult.get();
+	}
+
+	//Loom 0.2.7 fallback
+	Path getNewMinecraftDevJar() throws FileNotFoundException {
+		Optional<Path> entrypointResult = getSource(Knot.class.getClassLoader(), "mappings/mappings.tiny");
+
+		if (entrypointResult.isPresent()) {
+			Path path = entrypointResult.get().getParent();
+			Path minecraftJar = path.resolve(String.format("minecraft-%s-client.jar", OptifineVersion.minecraftVersion)); //Lets hope you are using loom in dev
+			if (Files.exists(minecraftJar)) {
+				return minecraftJar;
+			}
+		}
+
+		throw new FileNotFoundException("Could not find minecraft jar!");
 	}
 
 	//Stolen from fabric loader
@@ -308,17 +288,6 @@ public class OptifineSetup {
 		}
 
 		return Optional.empty();
-	}
-
-	//We need to generate the full mappings with enum names as loom does not have these on the classpath
-	File getDevMappings() throws Exception {
-		CommandProposeFieldNames fieldNames = new CommandProposeFieldNames();
-		File fieldMappings = new File(versionDir, "mappings.full.tiny");
-		if (fieldMappings.exists()) {
-			fieldMappings.delete();
-		}
-		fieldNames.run(new String[]{getMinecraftJar().normalize().toString(), extractMappings().getAbsolutePath(), fieldMappings.getAbsolutePath()});
-		return fieldMappings;
 	}
 
 	//Extracts the devtime mappings out of yarn into a file
